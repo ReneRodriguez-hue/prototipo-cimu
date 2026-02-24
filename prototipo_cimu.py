@@ -1165,19 +1165,17 @@ elif page == "🗺️ Mapa":
         metric_label = dict(metric_options).get(metric_key, metric_key)
 
         # Download HTML map
-        if st.button("Generar HTML para descargar"):
-            m = build_map(geojson, area_field, values, metric_label)
-            html = m.get_root().render().encode("utf-8")
-            st.download_button(
-                "Descargar mapa (HTML)",
-                data=html,
-                file_name=f"mapa_{'barrios' if nivel=='Barrios y veredas' else 'comunas'}_{metric_key}_{d_from}_a_{d_to}.html",
-                mime="text/html",
-            )
+        st.download_button(
+            "Descargar mapa (HTML)",
+            data=build_map(geojson, area_field, values, metric_label).get_root().render().encode("utf-8"),
+            file_name=f"mapa_{'barrios' if nivel=='Barrios y veredas' else 'comunas'}_{metric_key}_{d_from}_a_{d_to}.html",
+            mime="text/html",
+            key=f"dl_mapa_{nivel}_{metric_key}_{d_from.isoformat()}_{d_to.isoformat()}"
+        )
 
     with right:
         m = build_map(geojson, area_field, values, dict(metric_options).get(metric_key, metric_key))
-        st_folium(m, width=None, height=650)
+        st_folium(m, width=None, height=650, key=f"mapa_{nivel}_{metric_key}_{d_from.isoformat()}_{d_to.isoformat()}")
 
 #
 # =========================
@@ -1327,17 +1325,16 @@ elif page == "⚠️ Riesgos":
     # Mapa
     st.subheader("Mapa coroplético")
     m = build_map(geojson, area_field, values_by_area, metric_label)
-    st_folium(m, width=None, height=650)
+    st_folium(m, width=None, height=650, key=f"riesgos_mapa_{nivel_territorial}_{'-'.join(selected_levels) if selected_levels else 'todos'}_{d_from.isoformat()}_{d_to.isoformat()}")
 
     # Descarga HTML del mapa
-    if st.button("Descargar mapa (HTML)", key="btn_download_riesgos_map"):
-        html = m.get_root().render().encode("utf-8")
-        st.download_button(
-            "Descargar HTML",
-            data=html,
-            file_name=f"mapa_riesgos_{'barrios' if nivel_territorial=='Barrios y veredas' else 'comunas'}_{'_'.join(selected_levels) or 'todos'}_{d_from}_a_{d_to}.html",
-            mime="text/html",
-        )
+    st.download_button(
+        "Descargar mapa (HTML)",
+        data=m.get_root().render().encode("utf-8"),
+        file_name=f"mapa_riesgos_{'barrios' if nivel_territorial=='Barrios y veredas' else 'comunas'}_{'_'.join(selected_levels) or 'todos'}_{d_from}_a_{d_to}.html",
+        mime="text/html",
+        key=f"dl_riesgos_mapa_{nivel_territorial}_{'-'.join(selected_levels) if selected_levels else 'todos'}_{d_from.isoformat()}_{d_to.isoformat()}"
+    )
 
     # Export PDF
     if st.button("Exportar PDF (Riesgos)"):
