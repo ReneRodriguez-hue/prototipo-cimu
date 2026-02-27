@@ -10,6 +10,7 @@ from typing import Dict, List
 
 import streamlit as st
 import matplotlib.pyplot as plt
+import plotly.graph_objects as go
 
 import folium
 from streamlit_folium import st_folium
@@ -24,6 +25,7 @@ from reportlab.lib.utils import ImageReader
 # =========================
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BUILD_TAG = "v1.6-compare-hover"
 
 GEOJSON_COMUNAS_PATH = os.path.join(BASE_DIR, "comunas_corregimientos.geojson")
 GEOJSON_BARRIOS_PATH = os.path.join(BASE_DIR, "barrios_veredas.geojson")
@@ -68,6 +70,7 @@ VIOL_COLORS = {
     "ECONOMICA": "#1f0a3d",
 }
 
+
 CONTEXT_KEYS = ["VIF", "DELITOS_SEXUALES", "HOMICIDIOS_MUJER", "FEMINICIDIOS"]
 
 CONTEXT_LABELS = {
@@ -77,17 +80,42 @@ CONTEXT_LABELS = {
     "FEMINICIDIOS": "Feminicidios",
 }
 
+# Paleta consistente para Contexto (mismos tonos morado/verde del resto)
+CONTEXT_COLORS = {
+    "VIF": SOURCE_COLORS["SIVIGILA"],          # morado oscuro
+    "DELITOS_SEXUALES": SOURCE_COLORS["COMISARIAS"],  # morado
+    "HOMICIDIOS_MUJER": SOURCE_COLORS["CASA_MATRIA"], # lila
+    "FEMINICIDIOS": SOURCE_COLORS["EAE"],      # verde
+}
+
 # =========================
 # RIESGOS (mock determinístico)
 # =========================
 
-RISK_LEVELS = ["BAJO", "MEDIO", "ALTO", "EXTREMO"]
+RISK_LEVELS = ["HAY_RIESGO", "NO_RIESGO"]
 RISK_LEVEL_LABELS = {
-    "BAJO": "Bajo",
-    "MEDIO": "Medio",
-    "ALTO": "Alto",
-    "EXTREMO": "Extremo",
+    "HAY_RIESGO": "HAY RIESGO",
+    "NO_RIESGO": "NO HAY RIESGO",
 }
+
+# Compatibilidad: si en session_state quedaron niveles antiguos (BAJO/MEDIO/ALTO/EXTREMO)
+# los normalizamos al esquema binario solicitado.
+LEGACY_RISK_LEVEL_MAP = {
+    "BAJO": "NO_RIESGO",
+    "MEDIO": "HAY_RIESGO",
+    "ALTO": "HAY_RIESGO",
+    "EXTREMO": "HAY_RIESGO",
+}
+
+def normalize_risk_levels(levels: List[str]) -> List[str]:
+    if not levels:
+        return []
+    out: List[str] = []
+    for lvl in levels:
+        lvl2 = LEGACY_RISK_LEVEL_MAP.get(lvl, lvl)
+        if lvl2 in RISK_LEVELS and lvl2 not in out:
+            out.append(lvl2)
+    return out
 
 RISK_TYPES = [
     "VIF_REINCIDENCIA",
@@ -430,7 +458,7 @@ class DataModel:
             return {}
 
         selected_types = selected_types or list(RISK_TYPES)
-        selected_levels = selected_levels or list(RISK_LEVELS)
+        selected_levels = normalize_risk_levels(selected_levels or list(RISK_LEVELS))
 
         risks = self.aggregate_risks(d_from, d_to, selected_types=selected_types)
         totals_by_level = risks.get("totals_by_level", {})
@@ -483,6 +511,8 @@ class DataModel:
         """
         if selected_types is None or len(selected_types) == 0:
             selected_types = list(RISK_TYPES)
+        # Asegura que no queden niveles legacy en memoria/caché
+        _ = normalize_risk_levels(list(RISK_LEVELS))
 
         # Base: lo amarramos al volumen general del rango para que tenga coherencia
         agg = self.aggregate(d_from, d_to)
@@ -504,12 +534,10 @@ class DataModel:
         if days <= 0:
             risk_pool = 0
 
-        # Preferencias: más MEDIO/ALTO que EXTREMO, y BAJO también relevante
+        # Distribución binaria: Hay riesgo vs No hay riesgo
         level_weights = {
-            "BAJO": 0.28,
-            "MEDIO": 0.34,
-            "ALTO": 0.28,
-            "EXTREMO": 0.10,
+            "HAY_RIESGO": 0.45,
+            "NO_RIESGO": 0.55,
         }
 
         # Preferencias por tipo (puedes ajustar)
@@ -543,7 +571,7 @@ class DataModel:
         totals_by_type = {t: 0 for t in selected_types}
 
         # Dentro de cada tipo, distribuimos por nivel con leve variación
-        base_level_vec = [level_weights[l] for l in RISK_LEVELS]
+        base_level_vec = [level_weights.get(l, 0.0) for l in RISK_LEVELS]
         for t, n_t in zip(selected_types, type_counts):
             # Variación suave por tipo
             props = dirichlet_like(rng, base_level_vec, sharpness=28.0)
@@ -616,7 +644,48 @@ def fig_grouped_bars(monthly: Dict[str, List[int]]):
     fig.tight_layout()
     return fig
 
-def fig_total_line(total_monthly: List[int]):
+# === Plotly version: grouped bars with hover (same palette) ===
+def fig_grouped_bars_hover(monthly: Dict[str, List[int]]):
+    """Barras agrupadas interactivas (hover): mujeres atendidas por organismo y mes."""
+    x = MONTHS_ES
+
+    # Orden fijo para que sea consistente con leyenda/paleta
+    series = ["CASA_MATRIA", "COMISARIAS", "EAE", "SIVIGILA"]
+    series_labels = {
+        "CASA_MATRIA": "CASA MATRIA",
+        "COMISARIAS": "COMISARÍAS",
+        "EAE": "EAE",
+        "SIVIGILA": "SIVIGILA",
+    }
+
+    fig = go.Figure()
+    for s in series:
+        y = [int(v) for v in (monthly.get(s, [0] * 12) or [0] * 12)]
+        fig.add_trace(
+            go.Bar(
+                x=x,
+                y=y,
+                name=series_labels.get(s, s),
+                marker=dict(color=SOURCE_COLORS.get(s, "#64748b"), line=dict(color="white", width=0.6)),
+                hovertemplate="%{x}<br>Organismo: "
+                + series_labels.get(s, s)
+                + "<br>Mujeres atendidas: %{y:,}<extra></extra>",
+            )
+        )
+
+    fig.update_layout(
+        title="Gráfico 1. Cantidad de mujeres atendidas por organismo y mes",
+        barmode="group",
+        height=420,
+        margin=dict(l=0, r=0, t=60, b=0),
+        hovermode="x unified",
+        legend=dict(orientation="v", x=1.02, y=0.5, xanchor="left", yanchor="middle"),
+    )
+    fig.update_xaxes(tickangle=-45)
+    fig.update_yaxes(title_text="Número de casos", gridcolor="rgba(148,163,184,0.25)")
+    return fig
+
+def fig_total_line_static(total_monthly: List[int]):
     fig, ax = plt.subplots(figsize=(10, 3.8))
     x = list(range(12))
     ax.plot(x, total_monthly, marker="o")
@@ -627,18 +696,201 @@ def fig_total_line(total_monthly: List[int]):
     fig.tight_layout()
     return fig
 
+# === Plotly version: interactive two-line chart with hover ===
+def fig_total_line_hover(total_monthly: List[int]):
+    """Dos líneas interactivas (hover): Total atenciones vs Mujeres atendidas (estimado)."""
+    x = MONTHS_ES
+
+    month_factors = [0.84, 0.83, 0.835, 0.832, 0.838, 0.834, 0.845, 0.846, 0.836, 0.839, 0.833, 0.825]
+    women_monthly = [int(round(v * month_factors[i])) for i, v in enumerate(total_monthly)]
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=x,
+            y=total_monthly,
+            mode="lines+markers",
+            name="Total atenciones",
+            line=dict(color=SOURCE_COLORS["SIVIGILA"], width=3),
+            marker=dict(color=SOURCE_COLORS["SIVIGILA"], size=7),
+            hovertemplate="%{x}<br>Total atenciones: %{y:,}<extra></extra>",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=x,
+            y=women_monthly,
+            mode="lines+markers",
+            name="Mujeres atendidas (estimado)",
+            line=dict(color=SOURCE_COLORS["COMISARIAS"], width=3),
+            marker=dict(color=SOURCE_COLORS["COMISARIAS"], size=7),
+            hovertemplate="%{x}<br>Mujeres atendidas (est.): %{y:,}<extra></extra>",
+        )
+    )
+
+    # Formato miles con punto (ES) en hover: reemplazo simple en frontend no aplica;
+    # dejamos coma de Plotly, pero el valor es claro. Si quieres punto, lo ajustamos luego.
+    fig.update_layout(
+        title="Tendencia mensual: total atenciones vs mujeres atendidas",
+        margin=dict(l=0, r=0, t=50, b=0),
+        height=360,
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+    )
+    fig.update_xaxes(tickangle=-45)
+    fig.update_yaxes(title_text="Número de casos")
+    return fig
+
 
 def fig_donut(distribution: Dict[str, int]):
     fig, ax = plt.subplots(figsize=(6, 4))
+
     labels = list(distribution.keys())
-    values = [distribution[k] for k in labels]
+    values = [int(distribution.get(k, 0)) for k in labels]
     colors = [SOURCE_COLORS.get(k, None) for k in labels]
-    wedges, _ = ax.pie(values, colors=colors, startangle=90)
-    ax.pie([1], colors=["white"], radius=0.70)
+
+    total = sum(values)
+    if total <= 0:
+        # evita división por cero y mantiene la visual aunque no haya datos
+        values = [1 for _ in values]
+        total = sum(values)
+
+    def autopct_func(pct: float) -> str:
+        # muestra solo segmentos visibles
+        return f"{pct:.1f}%" if pct >= 1 else ""
+
+    wedges, texts, autotexts = ax.pie(
+        values,
+        colors=colors,
+        startangle=90,
+        autopct=autopct_func,
+        pctdistance=0.78,
+        wedgeprops={"width": 0.35, "edgecolor": "white"},
+    )
+
+    # Estilo de los porcentajes para que SIEMPRE se vean
+    for t in autotexts:
+        t.set_fontsize(9)
+        t.set_weight("bold")
+        t.set_color("white")
+        # borde/halo oscuro para legibilidad en segmentos claros
+        try:
+            import matplotlib.patheffects as pe
+            t.set_path_effects([pe.withStroke(linewidth=2, foreground="#111827")])
+        except Exception:
+            pass
+
     ax.set_title("Distribución por organismo")
-    ax.legend(wedges, labels, loc="center left", bbox_to_anchor=(1.01, 0.5), frameon=False, fontsize=8)
+    ax.legend(
+        wedges,
+        labels,
+        loc="center left",
+        bbox_to_anchor=(1.01, 0.5),
+        frameon=False,
+        fontsize=8,
+    )
     ax.axis("equal")
+
     fig.tight_layout()
+    return fig
+
+
+# =========================
+# DONUT INTERACTIVO (Plotly)
+# =========================
+
+def fig_donut_hover(distribution: Dict[str, int]):
+    """Dona interactiva: NO muestra etiquetas; porcentajes aparecen al pasar el mouse."""
+    labels = list(distribution.keys())
+    values = [int(distribution.get(k, 0)) for k in labels]
+    colors = [SOURCE_COLORS.get(k, "#64748b") for k in labels]
+
+    # Evita gráfico vacío
+    if sum(values) <= 0:
+        values = [1 for _ in values]
+
+    fig = go.Figure(
+        data=[
+            go.Pie(
+                labels=labels,
+                values=values,
+                hole=0.65,
+                marker=dict(colors=colors, line=dict(color="white", width=1)),
+                textinfo="none",  # <- no texto visible
+                hovertemplate="%{label}<br>%{percent:.1%} (%{value})<extra></extra>",
+            )
+        ]
+    )
+    fig.update_layout(
+        title_text="Distribución por organismo",
+        margin=dict(l=0, r=0, t=40, b=0),
+        legend=dict(orientation="v", x=1.02, y=0.5, xanchor="left", yanchor="middle"),
+        height=360,
+    )
+    return fig
+
+# =========================
+# G2 / G3 INTERACTIVOS (Plotly - hover)
+# =========================
+
+def fig_g2_hover(g2_pct: Dict[str, List[int]]):
+    """Barras horizontales apiladas 100% (hover): relación -> % por edad."""
+    y = RELATIONS  # categorías
+    fig = go.Figure()
+
+    # Para apilado 100%, g2_pct ya viene en % enteros que suman 100 por fila.
+    for idx, age_key in enumerate(AGE_KEYS):
+        vals = [int(g2_pct.get(rel, [0]*len(AGE_KEYS))[idx]) for rel in y]
+        fig.add_trace(
+            go.Bar(
+                y=y,
+                x=vals,
+                orientation="h",
+                name=AGE_LEGEND[idx],
+                marker=dict(color=AGE_COLORS[age_key]),
+                hovertemplate="Relación: %{y}<br>" + AGE_LEGEND[idx] + ": %{x}%<extra></extra>",
+            )
+        )
+
+    fig.update_layout(
+        title="Gráfico 2. Distribución de rangos de edad según la relación familiar con la víctima",
+        barmode="stack",
+        height=520,
+        margin=dict(l=0, r=0, t=55, b=0),
+        legend=dict(orientation="v", x=1.02, y=0.5, xanchor="left", yanchor="middle"),
+    )
+    fig.update_xaxes(title_text="Porcentaje", range=[0, 100], gridcolor="rgba(148,163,184,0.25)")
+    fig.update_yaxes(autorange="reversed")
+    return fig
+
+
+def fig_g3_hover(g3_pct: Dict[str, List[int]]):
+    """Barras horizontales apiladas 100% (hover): edad -> % por tipo de violencia."""
+    y = AGE_LABELS_G3
+    fig = go.Figure()
+
+    for idx, key in enumerate(VIOL_KEYS):
+        vals = [int(g3_pct.get(age, [0]*len(VIOL_KEYS))[idx]) for age in y]
+        fig.add_trace(
+            go.Bar(
+                y=y,
+                x=vals,
+                orientation="h",
+                name=VIOL_LEGEND[idx],
+                marker=dict(color=VIOL_COLORS[key]),
+                hovertemplate="Edad: %{y}<br>" + VIOL_LEGEND[idx] + ": %{x}%<extra></extra>",
+            )
+        )
+
+    fig.update_layout(
+        title="Gráfico 3. Distribución de rangos de edad según el tipo de violencia",
+        barmode="stack",
+        height=520,
+        margin=dict(l=0, r=0, t=55, b=0),
+        legend=dict(orientation="v", x=1.02, y=0.5, xanchor="left", yanchor="middle"),
+    )
+    fig.update_xaxes(title_text="Porcentaje", range=[0, 100], gridcolor="rgba(148,163,184,0.25)")
+    fig.update_yaxes(autorange="reversed")
     return fig
 
 
@@ -656,8 +908,24 @@ def fig_compare_sources_two_months(monthly: Dict[str, List[int]], month_a_idx: i
     x = list(range(len(sources)))
     width = 0.36
 
-    ax.bar([i - width/2 for i in x], a_vals, width=width, label=MONTHS_ES[month_a_idx])
-    ax.bar([i + width/2 for i in x], b_vals, width=width, label=MONTHS_ES[month_b_idx])
+    ax.bar(
+        [i - width/2 for i in x],
+        a_vals,
+        width=width,
+        label=MONTHS_ES[month_a_idx],
+        color=SOURCE_COLORS["SIVIGILA"],  # morado oscuro
+        edgecolor="white",
+        linewidth=0.6,
+    )
+    ax.bar(
+        [i + width/2 for i in x],
+        b_vals,
+        width=width,
+        label=MONTHS_ES[month_b_idx],
+        color=SOURCE_COLORS["EAE"],  # verde
+        edgecolor="white",
+        linewidth=0.6,
+    )
 
     ax.set_title("Comparación: mujeres atendidas por organismo (mes vs mes)")
     ax.set_ylabel("Número de casos")
@@ -666,6 +934,48 @@ def fig_compare_sources_two_months(monthly: Dict[str, List[int]], month_a_idx: i
     ax.grid(axis="y", alpha=0.25)
     ax.legend(frameon=False)
     fig.tight_layout()
+    return fig
+
+# === Plotly version: interactive two-month comparison with hover ===
+def fig_compare_sources_two_months_hover(monthly: Dict[str, List[int]], month_a_idx: int, month_b_idx: int):
+    """Comparación interactiva (hover): organismo en dos meses."""
+    sources = ["SIVIGILA", "COMISARIAS", "CASA_MATRIA", "EAE"]
+    labels_x = ["SIVIGILA", "COMISARÍAS", "CASA MATRIA", "EAE"]
+
+    a_vals = [int(monthly.get(s, [0]*12)[month_a_idx]) for s in sources]
+    b_vals = [int(monthly.get(s, [0]*12)[month_b_idx]) for s in sources]
+
+    name_a = MONTHS_ES[month_a_idx]
+    name_b = MONTHS_ES[month_b_idx]
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Bar(
+            x=labels_x,
+            y=a_vals,
+            name=name_a,
+            marker=dict(color=SOURCE_COLORS["SIVIGILA"], line=dict(color="white", width=0.6)),
+            hovertemplate="Organismo: %{x}<br>" + name_a + ": %{y:,}<extra></extra>",
+        )
+    )
+    fig.add_trace(
+        go.Bar(
+            x=labels_x,
+            y=b_vals,
+            name=name_b,
+            marker=dict(color=SOURCE_COLORS["EAE"], line=dict(color="white", width=0.6)),
+            hovertemplate="Organismo: %{x}<br>" + name_b + ": %{y:,}<extra></extra>",
+        )
+    )
+
+    fig.update_layout(
+        title="Comparación: mujeres atendidas por organismo (mes vs mes)",
+        barmode="group",
+        height=420,
+        margin=dict(l=0, r=0, t=55, b=0),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+    )
+    fig.update_yaxes(title_text="Número de casos", gridcolor="rgba(148,163,184,0.25)")
     return fig
 
 # === NUEVA FUNCIÓN DE COMPARACIÓN DE DOS RANGOS POR ORGANISMO ===
@@ -685,8 +995,24 @@ def fig_compare_sources_two_ranges(agg_a: dict, agg_b: dict, label_a: str, label
     x = list(range(len(sources)))
     width = 0.36
 
-    ax.bar([i - width/2 for i in x], a_vals, width=width, label=label_a)
-    ax.bar([i + width/2 for i in x], b_vals, width=width, label=label_b)
+    ax.bar(
+        [i - width/2 for i in x],
+        a_vals,
+        width=width,
+        label=label_a,
+        color=SOURCE_COLORS["SIVIGILA"],  # morado oscuro
+        edgecolor="white",
+        linewidth=0.6,
+    )
+    ax.bar(
+        [i + width/2 for i in x],
+        b_vals,
+        width=width,
+        label=label_b,
+        color=SOURCE_COLORS["EAE"],  # verde
+        edgecolor="white",
+        linewidth=0.6,
+    )
 
     ax.set_title("Comparación: mujeres atendidas por organismo (rango vs rango)")
     ax.set_ylabel("Número de casos")
@@ -697,13 +1023,78 @@ def fig_compare_sources_two_ranges(agg_a: dict, agg_b: dict, label_a: str, label
     fig.tight_layout()
     return fig
 
+# === Plotly version: interactive range-vs-range comparison with hover ===
+def fig_compare_sources_two_ranges_hover(agg_a: dict, agg_b: dict, label_a: str, label_b: str):
+    """Comparación interactiva (hover): organismo en dos rangos."""
+    sources = ["SIVIGILA", "COMISARIAS", "CASA_MATRIA", "EAE"]
+    labels_x = ["SIVIGILA", "COMISARÍAS", "CASA MATRIA", "EAE"]
+
+    k_a = agg_a.get("kpis", {}) or {}
+    k_b = agg_b.get("kpis", {}) or {}
+
+    a_vals = [int(k_a.get(s, 0)) for s in sources]
+    b_vals = [int(k_b.get(s, 0)) for s in sources]
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Bar(
+            x=labels_x,
+            y=a_vals,
+            name=label_a,
+            marker=dict(color=SOURCE_COLORS["SIVIGILA"], line=dict(color="white", width=0.6)),
+            hovertemplate="Organismo: %{x}<br>Periodo A: %{y:,}<extra></extra>",
+        )
+    )
+    fig.add_trace(
+        go.Bar(
+            x=labels_x,
+            y=b_vals,
+            name=label_b,
+            marker=dict(color=SOURCE_COLORS["EAE"], line=dict(color="white", width=0.6)),
+            hovertemplate="Organismo: %{x}<br>Periodo B: %{y:,}<extra></extra>",
+        )
+    )
+
+    fig.update_layout(
+        title="Comparación: mujeres atendidas por organismo (rango vs rango)",
+        barmode="group",
+        height=420,
+        margin=dict(l=0, r=0, t=55, b=0),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+    )
+    fig.update_yaxes(title_text="Número de casos", gridcolor="rgba(148,163,184,0.25)")
+    return fig
+
 def fig_g2(g2_pct: Dict[str, List[int]]):
     fig, ax = plt.subplots(figsize=(10, 5))
     y = list(range(len(RELATIONS)))
     left = [0] * len(RELATIONS)
     for idx, age_key in enumerate(AGE_KEYS):
         vals = [g2_pct[rel][idx] for rel in RELATIONS]
-        ax.barh(y, vals, left=left, color=AGE_COLORS[age_key], edgecolor="none", height=0.6, label=AGE_LEGEND[idx])
+        bars = ax.barh(
+            y,
+            vals,
+            left=left,
+            color=AGE_COLORS[age_key],
+            edgecolor="none",
+            height=0.6,
+            label=AGE_LEGEND[idx],
+        )
+
+        # Agregar porcentajes dentro de cada segmento (si es visible)
+        for i, (bar, v) in enumerate(zip(bars, vals)):
+            if v >= 5:  # solo mostramos si el segmento es suficientemente grande
+                ax.text(
+                    left[i] + v / 2,
+                    bar.get_y() + bar.get_height() / 2,
+                    f"{v}%",
+                    ha="center",
+                    va="center",
+                    fontsize=8,
+                    color="white",
+                    fontweight="bold",
+                )
+
         left = [l + v for l, v in zip(left, vals)]
     ax.set_xlim(0, 100)
     ax.set_yticks(y)
@@ -723,7 +1114,30 @@ def fig_g3(g3_pct: Dict[str, List[int]]):
     left = [0] * len(rows)
     for idx, key in enumerate(VIOL_KEYS):
         vals = [g3_pct[age][idx] for age in rows]
-        ax.barh(y, vals, left=left, color=VIOL_COLORS[key], edgecolor="none", height=0.6, label=VIOL_LEGEND[idx])
+        bars = ax.barh(
+            y,
+            vals,
+            left=left,
+            color=VIOL_COLORS[key],
+            edgecolor="none",
+            height=0.6,
+            label=VIOL_LEGEND[idx],
+        )
+
+        # Agregar porcentajes dentro de cada segmento (si es visible)
+        for i, (bar, v) in enumerate(zip(bars, vals)):
+            if v >= 5:
+                ax.text(
+                    left[i] + v / 2,
+                    bar.get_y() + bar.get_height() / 2,
+                    f"{v}%",
+                    ha="center",
+                    va="center",
+                    fontsize=8,
+                    color="white",
+                    fontweight="bold",
+                )
+
         left = [l + v for l, v in zip(left, vals)]
     ax.set_xlim(0, 100)
     ax.set_yticks(y)
@@ -735,6 +1149,7 @@ def fig_g3(g3_pct: Dict[str, List[int]]):
     ax.legend(loc="center left", bbox_to_anchor=(1.01, 0.5), frameon=False, fontsize=8)
     fig.tight_layout()
     return fig
+
 
 def fig_context_bar(ct: Dict[str, int]):
     fig, ax = plt.subplots(figsize=(10, 3.8))
@@ -760,12 +1175,81 @@ def fig_context_lines(cm: Dict[str, List[int]]):
     fig.tight_layout()
     return fig
 
+# =========================
+# CONTEXTO INTERACTIVO (Plotly - hover)
+# =========================
+
+def fig_context_bar_hover(ct: Dict[str, int]):
+    """Barras interactivas (hover): totales de contexto en el rango."""
+    labels = [CONTEXT_LABELS[k] for k in CONTEXT_KEYS]
+    values = [int(ct.get(k, 0)) for k in CONTEXT_KEYS]
+    colors = [CONTEXT_COLORS.get(k, "#64748b") for k in CONTEXT_KEYS]
+
+    fig = go.Figure(
+        data=[
+            go.Bar(
+                x=labels,
+                y=values,
+                marker=dict(color=colors, line=dict(color="white", width=0.6)),
+                hovertemplate="%{x}<br>Valor: %{y:,}<extra></extra>",
+            )
+        ]
+    )
+    fig.update_layout(
+        title="Contexto: totales en el rango",
+        height=360,
+        margin=dict(l=0, r=0, t=55, b=0),
+    )
+    fig.update_yaxes(title_text="Número de casos", gridcolor="rgba(148,163,184,0.25)")
+    fig.update_xaxes(tickangle=-20)
+    return fig
+
+
+def fig_context_lines_hover(cm: Dict[str, List[int]]):
+    """Líneas interactivas (hover): tendencia mensual de contexto."""
+    x = MONTHS_ES
+    fig = go.Figure()
+
+    for kx in CONTEXT_KEYS:
+        y = cm.get(kx, [0] * 12) or [0] * 12
+        fig.add_trace(
+            go.Scatter(
+                x=x,
+                y=y,
+                mode="lines+markers",
+                name=CONTEXT_LABELS.get(kx, kx),
+                line=dict(color=CONTEXT_COLORS.get(kx, "#64748b"), width=3),
+                marker=dict(color=CONTEXT_COLORS.get(kx, "#64748b"), size=7),
+                hovertemplate="%{x}<br>%{fullData.name}: %{y:,}<extra></extra>",
+            )
+        )
+
+    fig.update_layout(
+        title="Contexto: tendencia mensual",
+        height=420,
+        margin=dict(l=0, r=0, t=55, b=0),
+        hovermode="x unified",
+        legend=dict(orientation="v", x=1.02, y=0.5, xanchor="left", yanchor="middle"),
+    )
+    fig.update_xaxes(tickangle=-45)
+    fig.update_yaxes(title_text="Número de casos", gridcolor="rgba(148,163,184,0.25)")
+    return fig
+
 
 def fig_risk_levels_bar(totals_by_level: Dict[str, int]):
     fig, ax = plt.subplots(figsize=(10, 3.6))
+
     labels = [RISK_LEVEL_LABELS[l] for l in RISK_LEVELS]
-    values = [totals_by_level.get(l, 0) for l in RISK_LEVELS]
-    ax.bar(labels, values)
+    values = [int(totals_by_level.get(l, 0)) for l in RISK_LEVELS]
+
+    # Paleta consistente (morado/verde)
+    risk_colors = {
+        "HAY_RIESGO": SOURCE_COLORS["SIVIGILA"],  # morado oscuro
+        "NO_RIESGO": SOURCE_COLORS["EAE"],        # verde
+    }
+    colors = [risk_colors.get(lvl, "#64748b") for lvl in RISK_LEVELS]
+
+    ax.bar(labels, values, color=colors, edgecolor="white", linewidth=0.6)
     ax.set_title("Riesgos: distribución por nivel")
     ax.grid(axis="y", alpha=0.25)
     fig.tight_layout()
@@ -787,14 +1271,101 @@ def fig_risk_types_bar(totals_by_type: Dict[str, int], selected_types: List[str]
 def fig_risk_trend(monthly_by_level: Dict[str, List[int]]):
     fig, ax = plt.subplots(figsize=(10, 3.8))
     x = list(range(12))
+
+    # Paleta consistente (morado/verde)
+    risk_colors = {
+        "HAY_RIESGO": SOURCE_COLORS["SIVIGILA"],  # morado oscuro
+        "NO_RIESGO": SOURCE_COLORS["EAE"],        # verde
+    }
+
     for lvl in RISK_LEVELS:
-        ax.plot(x, monthly_by_level.get(lvl, [0]*12), marker="o", label=RISK_LEVEL_LABELS[lvl])
+        y = monthly_by_level.get(lvl, [0] * 12)
+        ax.plot(
+            x,
+            y,
+            marker="o",
+            label=RISK_LEVEL_LABELS[lvl],
+            color=risk_colors.get(lvl, "#64748b"),
+            linewidth=2.5,
+            markersize=5,
+        )
+
     ax.set_title("Riesgos: tendencia mensual por nivel")
     ax.set_xticks(x)
     ax.set_xticklabels(MONTHS_ES, rotation=45, ha="right", fontsize=8)
     ax.grid(alpha=0.25)
     ax.legend(loc="center left", bbox_to_anchor=(1.01, 0.5), frameon=False, fontsize=9)
     fig.tight_layout()
+    return fig
+
+
+# =========================
+# RIESGOS INTERACTIVOS (Plotly - hover)
+# =========================
+
+def fig_risk_levels_bar_hover(totals_by_level: Dict[str, int]):
+    """Barras interactivas (hover): distribución por nivel (HAY RIESGO / NO HAY RIESGO)."""
+    labels = [RISK_LEVEL_LABELS[l] for l in RISK_LEVELS]
+    values = [int(totals_by_level.get(l, 0)) for l in RISK_LEVELS]
+
+    risk_colors = {
+        "HAY_RIESGO": SOURCE_COLORS["SIVIGILA"],  # morado oscuro
+        "NO_RIESGO": SOURCE_COLORS["EAE"],        # verde
+    }
+    colors = [risk_colors.get(lvl, "#64748b") for lvl in RISK_LEVELS]
+
+    fig = go.Figure(
+        data=[
+            go.Bar(
+                x=labels,
+                y=values,
+                marker=dict(color=colors, line=dict(color="white", width=0.6)),
+                hovertemplate="%{x}<br>Valor: %{y:,}<extra></extra>",
+            )
+        ]
+    )
+    fig.update_layout(
+        title="Riesgos: distribución por nivel",
+        height=360,
+        margin=dict(l=0, r=0, t=55, b=0),
+    )
+    fig.update_yaxes(title_text="Número de casos", gridcolor="rgba(148,163,184,0.25)")
+    return fig
+
+
+def fig_risk_trend_hover(monthly_by_level: Dict[str, List[int]]):
+    """Líneas interactivas (hover): tendencia mensual por nivel."""
+    x = MONTHS_ES
+
+    risk_colors = {
+        "HAY_RIESGO": SOURCE_COLORS["SIVIGILA"],  # morado oscuro
+        "NO_RIESGO": SOURCE_COLORS["EAE"],        # verde
+    }
+
+    fig = go.Figure()
+    for lvl in RISK_LEVELS:
+        y = monthly_by_level.get(lvl, [0] * 12) or [0] * 12
+        fig.add_trace(
+            go.Scatter(
+                x=x,
+                y=y,
+                mode="lines+markers",
+                name=RISK_LEVEL_LABELS.get(lvl, lvl),
+                line=dict(color=risk_colors.get(lvl, "#64748b"), width=3),
+                marker=dict(color=risk_colors.get(lvl, "#64748b"), size=7),
+                hovertemplate="%{x}<br>%{fullData.name}: %{y:,}<extra></extra>",
+            )
+        )
+
+    fig.update_layout(
+        title="Riesgos: tendencia mensual por nivel",
+        height=420,
+        margin=dict(l=0, r=0, t=55, b=0),
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+    )
+    fig.update_xaxes(tickangle=-45)
+    fig.update_yaxes(title_text="Número de casos", gridcolor="rgba(148,163,184,0.25)")
     return fig
 
 
@@ -919,6 +1490,7 @@ model = get_model()
 
 st.sidebar.title("REPORTE CIMU")
 page = st.sidebar.radio("Secciones", ["📊 Dashboard", "📈 Análisis", "🗺️ Mapa", "⚠️ Riesgos", "🧾 Contexto"], index=0)
+st.sidebar.caption(f"Build: {BUILD_TAG}")
 
 # Global date filter
 st.sidebar.subheader("Filtro de fechas")
@@ -961,14 +1533,57 @@ if page == "📊 Dashboard":
     d3.metric("CASA MATRIA", fmt_int(int(k.get("CASA_MATRIA", 0))))
     d4.metric("EAE", fmt_int(int(k.get("EAE", 0))))
 
-    fig1 = fig_grouped_bars(agg["monthly"])
-    st.pyplot(fig1, use_container_width=True)
+    # =========================================
+    # NUEVO: Total mujeres atendidas (rango) y discriminado por organismo
+    # =========================================
+    st.subheader("Total mujeres atendidas en el rango (discriminado por organismo)")
+
+    total_mujeres = int(k.get("TOTAL_ATENCIONES", 0))
+    org_labels = ["SIVIGILA", "COMISARÍAS", "CASA MATRIA", "EAE"]
+    org_values = [
+        int(k.get("SIVIGILA", 0)),
+        int(k.get("COMISARIAS", 0)),
+        int(k.get("CASA_MATRIA", 0)),
+        int(k.get("EAE", 0)),
+    ]
+
+    fig_total_org = go.Figure()
+    fig_total_org.add_trace(
+        go.Bar(
+            x=org_labels,
+            y=org_values,
+            marker=dict(
+                color=[
+                    SOURCE_COLORS["SIVIGILA"],
+                    SOURCE_COLORS["COMISARIAS"],
+                    SOURCE_COLORS["CASA_MATRIA"],
+                    SOURCE_COLORS["EAE"],
+                ],
+                line=dict(color="white", width=0.6),
+            ),
+            hovertemplate="Organismo: %{x}<br>Mujeres atendidas: %{y:,}<extra></extra>",
+        )
+    )
+
+    fig_total_org.update_layout(
+        title=f"Total mujeres atendidas en el rango: {fmt_int(total_mujeres)}",
+        height=380,
+        margin=dict(l=0, r=0, t=60, b=0),
+    )
+    fig_total_org.update_yaxes(
+        title_text="Número de mujeres atendidas",
+        gridcolor="rgba(148,163,184,0.25)",
+    )
+
+    st.plotly_chart(fig_total_org, use_container_width=True)
+
+    st.plotly_chart(fig_grouped_bars_hover(agg["monthly"]), use_container_width=True)
 
     a, b = st.columns([2, 1])
     with a:
-        st.pyplot(fig_total_line(agg["total_monthly"]), use_container_width=True)
+        st.plotly_chart(fig_total_line_hover(agg["total_monthly"]), use_container_width=True)
     with b:
-        st.pyplot(fig_donut(agg["distribution"]), use_container_width=True)
+        st.plotly_chart(fig_donut_hover(agg["distribution"]), use_container_width=True)
 
     st.divider()
     st.subheader("Comparar dos rangos")
@@ -1022,7 +1637,7 @@ if page == "📊 Dashboard":
     label_a = f"A: {a_from.isoformat()} → {a_to.isoformat()}"
     label_b = f"B: {b_from.isoformat()} → {b_to.isoformat()}"
 
-    st.pyplot(fig_compare_sources_two_ranges(agg_a, agg_b, label_a, label_b), use_container_width=True)
+    st.plotly_chart(fig_compare_sources_two_ranges_hover(agg_a, agg_b, label_a, label_b), use_container_width=True)
 
     # Tabla de comparación + delta
     sources = ["SIVIGILA", "COMISARIAS", "CASA_MATRIA", "EAE"]
@@ -1064,8 +1679,8 @@ if page == "📊 Dashboard":
 elif page == "📈 Análisis":
     st.header("Análisis (Gráficos)")
 
-    st.pyplot(fig_g2(agg["g2_pct"]), use_container_width=True)
-    st.pyplot(fig_g3(agg["g3_pct"]), use_container_width=True)
+    st.plotly_chart(fig_g2_hover(agg["g2_pct"]), use_container_width=True)
+    st.plotly_chart(fig_g3_hover(agg["g3_pct"]), use_container_width=True)
 
     if st.button("Exportar PDF (Análisis)"):
         figs = [
@@ -1099,7 +1714,7 @@ elif page == "🗺️ Mapa":
 
     with left:
         nivel = st.selectbox("Nivel territorial", ["Comunas y corregimientos", "Barrios y veredas"], index=0)
-        metric_options = [("TOTAL_ATENCIONES", "TOTAL ATENCIONES")] + [(k, CONTEXT_LABELS[k]) for k in CONTEXT_KEYS]
+        metric_options = [("TOTAL_ATENCIONES", "Mujeres atendidas")] + [(k, CONTEXT_LABELS[k]) for k in CONTEXT_KEYS]
         metric_key = st.selectbox("Métrica", metric_options, format_func=lambda x: x[1])[0]
 
         if nivel == "Barrios y veredas":
@@ -1184,22 +1799,31 @@ elif page == "🗺️ Mapa":
 elif page == "⚠️ Riesgos":
     st.header("Riesgos")
 
-    st.caption("Anexo: distribución de riesgos (mock determinístico, listo para conectar a datos reales).")
+    st.caption("Clasificación de riesgo según aportes de talleres (Sí hay riesgo / No hay riesgo).")
 
     # Filtros específicos de la sección
-    selected_types = st.multiselect(
-        "Tipologías de riesgo",
-        options=RISK_TYPES,
-        default=RISK_TYPES,
-        format_func=lambda t: RISK_TYPE_LABELS.get(t, t),
-    )
+
+    # Fijar todas las tipologías sin filtro
+    selected_types = list(RISK_TYPES)
+
+    # Niveles (solo dos opciones: HAY RIESGO / NO HAY RIESGO)
+    # Limpieza de estado: si antes existían BAJO/MEDIO/ALTO/EXTREMO, Streamlit puede recordarlos.
+    if "risk_levels" in st.session_state:
+        st.session_state["risk_levels"] = normalize_risk_levels(st.session_state.get("risk_levels") or [])
 
     selected_levels = st.multiselect(
         "Niveles de riesgo",
         options=RISK_LEVELS,
-        default=["ALTO", "EXTREMO"],
+        default=list(RISK_LEVELS),
         format_func=lambda l: RISK_LEVEL_LABELS.get(l, l),
+        key="risk_levels",
     )
+
+    # Normaliza por si llegan valores inesperados
+    selected_levels = normalize_risk_levels(selected_levels)
+
+    # Si el usuario deja vacío, interpretamos como "todos"
+    effective_levels = selected_levels if selected_levels else list(RISK_LEVELS)
 
     st.divider()
     st.subheader("Riesgos por territorio")
@@ -1210,41 +1834,67 @@ elif page == "⚠️ Riesgos":
         key="riesgos_nivel_territorial",
     )
 
-    risks = model.aggregate_risks(d_from, d_to, selected_types=selected_types)
+    risks = model.aggregate_risks(d_from, d_to, selected_types=list(RISK_TYPES))
 
-    totals_by_level = risks["totals_by_level"]
-    totals_by_type = risks["totals_by_type"]
-    matrix = risks["matrix"]
-    monthly_by_level = risks["monthly_by_level"]
+    # --- Aplicar filtros de niveles a TODO lo que se muestra (KPIs, gráficas, tabla, territorio) ---
+    # `aggregate_risks` genera todo en ambos niveles; aquí nos quedamos con los seleccionados.
+
+    def _filter_risks_by_levels(risks_dict: dict, levels: List[str]) -> dict:
+        matrix0 = risks_dict.get("matrix", {}) or {}
+        monthly0 = risks_dict.get("monthly_by_level", {}) or {}
+
+        # Totales por nivel (solo niveles seleccionados)
+        totals_by_level_sel = {lvl: 0 for lvl in levels}
+        for t, row in matrix0.items():
+            for lvl in levels:
+                totals_by_level_sel[lvl] += int((row or {}).get(lvl, 0))
+
+        # Totales por tipo (sumando solo niveles seleccionados)
+        totals_by_type_sel: Dict[str, int] = {}
+        for t, row in matrix0.items():
+            totals_by_type_sel[t] = sum(int((row or {}).get(lvl, 0)) for lvl in levels)
+
+        # Matriz filtrada
+        matrix_sel: Dict[str, Dict[str, int]] = {
+            t: {lvl: int((row or {}).get(lvl, 0)) for lvl in levels}
+            for t, row in matrix0.items()
+        }
+
+        # Tendencia mensual filtrada (para niveles no seleccionados = 0)
+        monthly_sel = {lvl: (monthly0.get(lvl, [0] * 12) or [0] * 12) for lvl in levels}
+
+        risk_pool_sel = sum(totals_by_level_sel.values())
+
+        return {
+            "risk_pool": int(risk_pool_sel),
+            "totals_by_level": totals_by_level_sel,
+            "totals_by_type": totals_by_type_sel,
+            "matrix": matrix_sel,
+            "monthly_by_level": monthly_sel,
+        }
+
+    risks_filtered = _filter_risks_by_levels(risks, effective_levels)
+
+    # Para mantener las gráficas consistentes (orden fijo), rellenamos con ceros los niveles NO seleccionados.
+    totals_by_level = {lvl: int(risks_filtered["totals_by_level"].get(lvl, 0)) if lvl in effective_levels else 0 for lvl in RISK_LEVELS}
+    monthly_by_level = {lvl: (risks_filtered["monthly_by_level"].get(lvl, [0] * 12) if lvl in effective_levels else [0] * 12) for lvl in RISK_LEVELS}
+
+
 
     # KPIs
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("TOTAL EVENTOS DE RIESGO", fmt_int(int(risks.get("risk_pool", 0))))
-    k2.metric("RIESGO ALTO", fmt_int(int(totals_by_level.get("ALTO", 0))))
-    k3.metric("RIESGO EXTREMO", fmt_int(int(totals_by_level.get("EXTREMO", 0))))
-    alto_extremo = int(totals_by_level.get("ALTO", 0)) + int(totals_by_level.get("EXTREMO", 0))
-    k4.metric("ALTO + EXTREMO", fmt_int(alto_extremo))
+    k1, k2, k3 = st.columns(3)
+    total_pool = int(risks_filtered.get("risk_pool", 0))
+    hay_riesgo_total = int(totals_by_level.get("HAY_RIESGO", 0))
+    no_riesgo_total = int(totals_by_level.get("NO_RIESGO", 0))
 
-    # Gráficos
-    st.pyplot(fig_risk_levels_bar(totals_by_level), use_container_width=True)
+    k1.metric("TOTAL EVENTOS EVALUADOS", fmt_int(total_pool))
+    k2.metric("HAY RIESGO", fmt_int(hay_riesgo_total))
+    k3.metric("NO HAY RIESGO", fmt_int(no_riesgo_total))
 
-    cA, cB = st.columns(2)
-    with cA:
-        st.pyplot(fig_risk_types_bar(totals_by_type, risks["selected_types"]), use_container_width=True)
-    with cB:
-        st.pyplot(fig_risk_trend(monthly_by_level), use_container_width=True)
-
-    # Matriz tipo x nivel (tabla)
-    st.subheader("Matriz: tipología × nivel")
-    table_rows = []
-    for t in risks["selected_types"]:
-        row = {"Tipología": RISK_TYPE_LABELS.get(t, t)}
-        for lvl in RISK_LEVELS:
-            row[RISK_LEVEL_LABELS[lvl]] = int(matrix.get(t, {}).get(lvl, 0))
-        row["Total"] = sum(int(matrix.get(t, {}).get(lvl, 0)) for lvl in RISK_LEVELS)
-        table_rows.append(row)
-
-    st.dataframe(table_rows, use_container_width=True, hide_index=True)
+    # Gráficos (hover)
+    st.plotly_chart(fig_risk_levels_bar_hover(totals_by_level), use_container_width=True)
+    st.caption("Los resultados cambian según los niveles seleccionados arriba.")
+    st.plotly_chart(fig_risk_trend_hover(monthly_by_level), use_container_width=True)
 
     # ===== Territorio (mapa + ranking) =====
     if nivel_territorial == "Barrios y veredas":
@@ -1306,11 +1956,12 @@ elif page == "⚠️ Riesgos":
         d_from,
         d_to,
         selected_types=risks["selected_types"],
-        selected_levels=selected_levels,
+        selected_levels=effective_levels,
         area_keys=area_keys,
     )
 
-    metric_label = "Riesgos" + (" (" + "+".join(RISK_LEVEL_LABELS.get(l, l) for l in selected_levels) + ")" if selected_levels else "")
+    lvl_txt = "+".join(RISK_LEVEL_LABELS.get(l, l) for l in (selected_levels or []))
+    metric_label = "Riesgos" + (f" ({lvl_txt})" if lvl_txt else "")
 
     # Ranking Top 10
     st.subheader("Top 10 territorios (por valor)")
@@ -1340,16 +1991,13 @@ elif page == "⚠️ Riesgos":
     if st.button("Exportar PDF (Riesgos)"):
         figs = [
             fig_to_png_bytes(fig_risk_levels_bar(totals_by_level)),
-            fig_to_png_bytes(fig_risk_types_bar(totals_by_type, risks["selected_types"])),
             fig_to_png_bytes(fig_risk_trend(monthly_by_level)),
         ]
         kpi_lines = [
             f"Rango: {d_from.isoformat()} → {d_to.isoformat()}",
-            f"TOTAL EVENTOS DE RIESGO: {fmt_int(int(risks.get('risk_pool', 0)))}",
-            f"RIESGO ALTO: {fmt_int(int(totals_by_level.get('ALTO', 0)))}",
-            f"RIESGO EXTREMO: {fmt_int(int(totals_by_level.get('EXTREMO', 0)))}",
-            f"ALTO + EXTREMO: {fmt_int(alto_extremo)}",
-            "Tipologías incluidas: " + ", ".join(RISK_TYPE_LABELS.get(t, t) for t in risks["selected_types"]),
+            f"TOTAL EVENTOS EVALUADOS: {fmt_int(int(risks_filtered.get('risk_pool', 0)))}",
+            f"HAY RIESGO: {fmt_int(int(totals_by_level.get('HAY_RIESGO', 0)))}",
+            f"NO HAY RIESGO: {fmt_int(int(totals_by_level.get('NO_RIESGO', 0)))}",
         ]
         pdf = build_pdf_bytes(
             "Reporte CIMU - Riesgos",
@@ -1370,14 +2018,69 @@ elif page == "⚠️ Riesgos":
 else:
     st.header("Contexto y fuentes")
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("VIF (rango)", fmt_int(int(ct.get("VIF", 0))))
-    c2.metric("Delitos sexuales (rango)", fmt_int(int(ct.get("DELITOS_SEXUALES", 0))))
-    c3.metric("Homicidios mujeres (rango)", str(ct.get("HOMICIDIOS_MUJER", 0)))
-    c4.metric("Feminicidios (rango)", str(ct.get("FEMINICIDIOS", 0)))
+    # =========================
+    # Comparativo con año anterior (mock determinístico)
+    # =========================
+    import random
 
-    st.pyplot(fig_context_bar(ct), use_container_width=True)
-    st.pyplot(fig_context_lines(cm), use_container_width=True)
+    seed_prev = (
+        int(d_from.strftime("%Y%m%d")) * 19
+        + int(d_to.strftime("%Y%m%d")) * 23
+        + 2024
+    )
+    rng_prev = random.Random(seed_prev)
+
+    prev_ct = {}
+    for kx in CONTEXT_KEYS:
+        actual = int(ct.get(kx, 0))
+        # Variación entre -15% y +15% para simular año anterior
+        factor = rng_prev.uniform(0.85, 1.15)
+        prev_ct[kx] = max(0, int(round(actual * factor)))
+
+    st.subheader("Comparativo con año anterior")
+
+    c1, c2, c3, c4 = st.columns(4)
+
+    def metric_with_delta(label, key):
+        actual = int(ct.get(key, 0))
+        prev = int(prev_ct.get(key, 0))
+        delta = actual - prev
+        pct = (delta / prev * 100.0) if prev > 0 else None
+        delta_str = f"{fmt_int(delta)} ({pct:.1f}%)" if pct is not None else fmt_int(delta)
+        return label, fmt_int(actual), delta_str
+
+    l1, v1, d1 = metric_with_delta("VIF (rango)", "VIF")
+    l2, v2, d2 = metric_with_delta("Delitos sexuales (rango)", "DELITOS_SEXUALES")
+    l3, v3, d3 = metric_with_delta("Homicidios mujeres (rango)", "HOMICIDIOS_MUJER")
+    l4, v4, d4 = metric_with_delta("Feminicidios (rango)", "FEMINICIDIOS")
+
+    c1.metric(l1, v1, d1)
+    c2.metric(l2, v2, d2)
+    c3.metric(l3, v3, d3)
+    c4.metric(l4, v4, d4)
+
+    # Tabla resumen comparativa
+    st.divider()
+    st.subheader("Resumen comparativo (actual vs año anterior)")
+
+    rows_cmp = []
+    for kx in CONTEXT_KEYS:
+        actual = int(ct.get(kx, 0))
+        prev = int(prev_ct.get(kx, 0))
+        delta = actual - prev
+        pct = (delta / prev * 100.0) if prev > 0 else None
+        rows_cmp.append({
+            "Indicador": CONTEXT_LABELS.get(kx, kx),
+            "Año actual": actual,
+            "Año anterior": prev,
+            "Diferencia": delta,
+            "% Variación": (f"{pct:.1f}%" if pct is not None else "—"),
+        })
+
+    st.dataframe(rows_cmp, use_container_width=True, hide_index=True)
+
+    st.plotly_chart(fig_context_bar_hover(ct), use_container_width=True)
+    st.plotly_chart(fig_context_lines_hover(cm), use_container_width=True)
 
     st.subheader("Fuentes y notas")
     st.write("• Policía Nacional – SIEDCO (VIF, delitos sexuales).")
