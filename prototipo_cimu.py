@@ -92,19 +92,24 @@ CONTEXT_COLORS = {
 # RIESGOS (mock determinístico)
 # =========================
 
-RISK_LEVELS = ["HAY_RIESGO", "NO_RIESGO"]
+# Solo dos niveles solicitados: Riesgo alto / Riesgo bajo
+RISK_LEVELS = ["ALTO", "BAJO"]
 RISK_LEVEL_LABELS = {
-    "HAY_RIESGO": "HAY RIESGO",
-    "NO_RIESGO": "NO HAY RIESGO",
+    "ALTO": "RIESGO ALTO",
+    "BAJO": "RIESGO BAJO",
 }
 
-# Compatibilidad: si en session_state quedaron niveles antiguos (BAJO/MEDIO/ALTO/EXTREMO)
+# Compatibilidad: si en session_state quedaron niveles antiguos (HAY_RIESGO/NO_RIESGO o BAJO/MEDIO/ALTO/EXTREMO)
 # los normalizamos al esquema binario solicitado.
 LEGACY_RISK_LEVEL_MAP = {
-    "BAJO": "NO_RIESGO",
-    "MEDIO": "HAY_RIESGO",
-    "ALTO": "HAY_RIESGO",
-    "EXTREMO": "HAY_RIESGO",
+    # Antiguo binario
+    "HAY_RIESGO": "ALTO",
+    "NO_RIESGO": "BAJO",
+    # Antiguo multiclase
+    "BAJO": "BAJO",
+    "MEDIO": "ALTO",
+    "ALTO": "ALTO",
+    "EXTREMO": "ALTO",
 }
 
 def normalize_risk_levels(levels: List[str]) -> List[str]:
@@ -366,6 +371,16 @@ class DataModel:
                 for i in range(len(AGE_KEYS)):
                     g2_counts[rel][i] += vec[i]
         g2_pct = {rel: to_percentages(g2_counts[rel]) for rel in RELATIONS}
+        # Totales reales por vínculo (para KPIs que deben sumar 100)
+        rel_totals = {rel: int(sum(g2_counts.get(rel, []))) for rel in RELATIONS}
+
+        # Subconjunto solicitado en comité (Foto 1): normalizamos SOLO estos 5 a 100%
+        rel_keys_5 = ["EX-PAREJA", "PAREJA", "FAMILIAR", "HIJO(A)", "PADRE"]
+        rel_pct_5 = {k: 0 for k in rel_keys_5}
+        c5 = [rel_totals.get(k, 0) for k in rel_keys_5]
+        if sum(c5) > 0:
+            p5 = to_percentages([int(v) for v in c5])
+            rel_pct_5 = {k: int(p) for k, p in zip(rel_keys_5, p5)}
 
         g3_counts = {age: [0]*len(VIOL_KEYS) for age in AGE_LABELS_G3}
         for r in rows:
@@ -374,6 +389,17 @@ class DataModel:
                 for i in range(len(VIOL_KEYS)):
                     g3_counts[age][i] += vec[i]
         g3_pct = {age: to_percentages(g3_counts[age]) for age in AGE_LABELS_G3}
+        # Totales reales por tipo de violencia (para KPIs que deben sumar 100)
+        viol_totals = {k: 0 for k in VIOL_KEYS}
+        for age in AGE_LABELS_G3:
+            vec = g3_counts.get(age, [0] * len(VIOL_KEYS))
+            for i, key in enumerate(VIOL_KEYS):
+                viol_totals[key] += int(vec[i])
+
+        viol_pct_total = {k: 0 for k in VIOL_KEYS}
+        if sum(viol_totals.values()) > 0:
+            p = to_percentages([int(viol_totals[k]) for k in VIOL_KEYS])
+            viol_pct_total = {k: int(v) for k, v in zip(VIOL_KEYS, p)}
 
         context_totals = {k: 0 for k in CONTEXT_KEYS}
         context_monthly = {k: [0]*12 for k in CONTEXT_KEYS}
@@ -398,7 +424,11 @@ class DataModel:
             "distribution": totals_src,
             "meta": {"days": days, "peak_month": peak_month, "peak_value": peak_value},
             "g2_pct": g2_pct,
+            "rel_totals": rel_totals,
+            "rel_pct_5": rel_pct_5,
             "g3_pct": g3_pct,
+            "viol_totals": viol_totals,
+            "viol_pct_total": viol_pct_total,
             "context_totals": context_totals,
             "context_monthly": context_monthly,
         }
@@ -534,10 +564,10 @@ class DataModel:
         if days <= 0:
             risk_pool = 0
 
-        # Distribución binaria: Hay riesgo vs No hay riesgo
+        # Distribución binaria: Riesgo alto vs Riesgo bajo
         level_weights = {
-            "HAY_RIESGO": 0.45,
-            "NO_RIESGO": 0.55,
+            "ALTO": 0.45,
+            "BAJO": 0.55,
         }
 
         # Preferencias por tipo (puedes ajustar)
@@ -894,6 +924,81 @@ def fig_g3_hover(g3_pct: Dict[str, List[int]]):
     return fig
 
 
+# =========================
+# KPIs VISUALES PORCENTUALES (vínculo y tipo de violencia)
+# =========================
+
+def fig_kpi_donut_percent(label: str, percent: int, color: str):
+    """
+    Dona tipo KPI para mostrar un porcentaje grande al centro.
+    """
+    percent = max(0, min(100, int(percent)))
+    remaining = 100 - percent
+
+    fig = go.Figure(
+        data=[
+            go.Pie(
+                values=[percent, remaining],
+                hole=0.75,
+                marker=dict(colors=[color, "#e5e7eb"]),
+                textinfo="none",
+                hovertemplate=label + "<br>%{value}%<extra></extra>",
+                sort=False,
+            )
+        ]
+    )
+
+    fig.update_layout(
+        showlegend=False,
+        margin=dict(l=0, r=0, t=40, b=0),
+        height=220,
+        annotations=[
+            dict(
+                text=f"<b>{percent}%</b><br><span style='font-size:12px'>{label}</span>",
+                x=0.5,
+                y=0.5,
+                showarrow=False,
+                font=dict(size=16),
+            )
+        ],
+    )
+    return fig
+
+
+def compute_relation_percentages(g2_pct: Dict[str, List[int]]) -> Dict[str, int]:
+    """(DEPRECADO) Se deja por compatibilidad.
+
+    Antes calculaba un promedio de porcentajes por edad (lo cual produce valores similares
+    y NO garantiza que la suma entre vínculos sea 100).
+
+    Los KPIs ahora deben usar `agg['rel_pct_5']` calculado desde conteos reales.
+    """
+    out = {}
+    for rel, vec in g2_pct.items():
+        out[rel] = int(round(sum(vec) / len(vec))) if vec else 0
+    return out
+
+
+def compute_violence_percentages(g3_pct: Dict[str, List[int]]) -> Dict[str, int]:
+    """(DEPRECADO) Se deja por compatibilidad.
+
+    Antes calculaba promedios por fila (no garantiza suma 100).
+
+    Los KPIs ahora deben usar `agg['viol_pct_total']` calculado desde conteos reales.
+    """
+    totals = {k: 0 for k in VIOL_KEYS}
+    n = len(g3_pct)
+
+    if n == 0:
+        return {k: 0 for k in VIOL_KEYS}
+
+    for age, vec in g3_pct.items():
+        for i, key in enumerate(VIOL_KEYS):
+            totals[key] += vec[i]
+
+    return {k: int(round(totals[k] / n)) for k in VIOL_KEYS}
+
+
 # === NUEVA FUNCIÓN DE COMPARACIÓN DE DOS MESES POR ORGANISMO ===
 def fig_compare_sources_two_months(monthly: Dict[str, List[int]], month_a_idx: int, month_b_idx: int):
     """Compara atenciones por organismo entre dos meses (barras lado a lado)."""
@@ -1244,8 +1349,8 @@ def fig_risk_levels_bar(totals_by_level: Dict[str, int]):
 
     # Paleta consistente (morado/verde)
     risk_colors = {
-        "HAY_RIESGO": SOURCE_COLORS["SIVIGILA"],  # morado oscuro
-        "NO_RIESGO": SOURCE_COLORS["EAE"],        # verde
+        "ALTO": SOURCE_COLORS["SIVIGILA"],  # morado oscuro
+        "BAJO": SOURCE_COLORS["EAE"],       # verde
     }
     colors = [risk_colors.get(lvl, "#64748b") for lvl in RISK_LEVELS]
 
@@ -1274,8 +1379,8 @@ def fig_risk_trend(monthly_by_level: Dict[str, List[int]]):
 
     # Paleta consistente (morado/verde)
     risk_colors = {
-        "HAY_RIESGO": SOURCE_COLORS["SIVIGILA"],  # morado oscuro
-        "NO_RIESGO": SOURCE_COLORS["EAE"],        # verde
+        "ALTO": SOURCE_COLORS["SIVIGILA"],  # morado oscuro
+        "BAJO": SOURCE_COLORS["EAE"],       # verde
     }
 
     for lvl in RISK_LEVELS:
@@ -1304,13 +1409,13 @@ def fig_risk_trend(monthly_by_level: Dict[str, List[int]]):
 # =========================
 
 def fig_risk_levels_bar_hover(totals_by_level: Dict[str, int]):
-    """Barras interactivas (hover): distribución por nivel (HAY RIESGO / NO HAY RIESGO)."""
+    """Barras interactivas (hover): distribución por nivel (Riesgo alto / Riesgo bajo)."""
     labels = [RISK_LEVEL_LABELS[l] for l in RISK_LEVELS]
     values = [int(totals_by_level.get(l, 0)) for l in RISK_LEVELS]
 
     risk_colors = {
-        "HAY_RIESGO": SOURCE_COLORS["SIVIGILA"],  # morado oscuro
-        "NO_RIESGO": SOURCE_COLORS["EAE"],        # verde
+        "ALTO": SOURCE_COLORS["SIVIGILA"],  # morado oscuro
+        "BAJO": SOURCE_COLORS["EAE"],       # verde
     }
     colors = [risk_colors.get(lvl, "#64748b") for lvl in RISK_LEVELS]
 
@@ -1338,8 +1443,8 @@ def fig_risk_trend_hover(monthly_by_level: Dict[str, List[int]]):
     x = MONTHS_ES
 
     risk_colors = {
-        "HAY_RIESGO": SOURCE_COLORS["SIVIGILA"],  # morado oscuro
-        "NO_RIESGO": SOURCE_COLORS["EAE"],        # verde
+        "ALTO": SOURCE_COLORS["SIVIGILA"],  # morado oscuro
+        "BAJO": SOURCE_COLORS["EAE"],       # verde
     }
 
     fig = go.Figure()
@@ -1679,6 +1784,41 @@ if page == "📊 Dashboard":
 elif page == "📈 Análisis":
     st.header("Análisis (Gráficos)")
 
+    # =========================================
+    # NUEVOS KPIs VISUALES - VÍNCULO FAMILIAR
+    # =========================================
+    st.subheader("Porcentaje según vínculo familiar con la víctima")
+
+    # Porcentajes reales (suman 100) para el set solicitado en comité (Foto 1)
+    rel_pct = (agg.get("rel_pct_5") or {})
+    rel_keys_display = ["EX-PAREJA", "PAREJA", "FAMILIAR", "HIJO(A)", "PADRE"]
+
+    cols = st.columns(len(rel_keys_display))
+    for col, rel in zip(cols, rel_keys_display):
+        with col:
+            color = SOURCE_COLORS["SIVIGILA"]
+            st.plotly_chart(
+                fig_kpi_donut_percent(rel.replace("HIJO(A)", "HIJOS"), rel_pct.get(rel, 0), color),
+                use_container_width=True,
+            )
+
+    # =========================================
+    # NUEVOS KPIs VISUALES - TIPO DE VIOLENCIA
+    # =========================================
+    st.subheader("Porcentaje según tipo de violencia")
+
+    # Porcentajes reales por tipo de violencia (suman 100)
+    viol_pct = (agg.get("viol_pct_total") or {})
+    cols2 = st.columns(len(VIOL_KEYS))
+
+    for col, key in zip(cols2, VIOL_KEYS):
+        with col:
+            color = VIOL_COLORS.get(key, SOURCE_COLORS["COMISARIAS"])
+            st.plotly_chart(
+                fig_kpi_donut_percent(VIOL_LEGEND[VIOL_KEYS.index(key)], viol_pct.get(key, 0), color),
+                use_container_width=True,
+            )
+
     st.plotly_chart(fig_g2_hover(agg["g2_pct"]), use_container_width=True)
     st.plotly_chart(fig_g3_hover(agg["g3_pct"]), use_container_width=True)
 
@@ -1799,7 +1939,7 @@ elif page == "🗺️ Mapa":
 elif page == "⚠️ Riesgos":
     st.header("Riesgos")
 
-    st.caption("Clasificación de riesgo según aportes de talleres (Sí hay riesgo / No hay riesgo).")
+    st.caption("Clasificación de riesgo según aportes de talleres (Riesgo alto / Riesgo bajo).")
 
     # Filtros específicos de la sección
 
@@ -1884,12 +2024,12 @@ elif page == "⚠️ Riesgos":
     # KPIs
     k1, k2, k3 = st.columns(3)
     total_pool = int(risks_filtered.get("risk_pool", 0))
-    hay_riesgo_total = int(totals_by_level.get("HAY_RIESGO", 0))
-    no_riesgo_total = int(totals_by_level.get("NO_RIESGO", 0))
+    riesgo_alto_total = int(totals_by_level.get("ALTO", 0))
+    riesgo_bajo_total = int(totals_by_level.get("BAJO", 0))
 
     k1.metric("TOTAL EVENTOS EVALUADOS", fmt_int(total_pool))
-    k2.metric("HAY RIESGO", fmt_int(hay_riesgo_total))
-    k3.metric("NO HAY RIESGO", fmt_int(no_riesgo_total))
+    k2.metric("RIESGO ALTO", fmt_int(riesgo_alto_total))
+    k3.metric("RIESGO BAJO", fmt_int(riesgo_bajo_total))
 
     # Gráficos (hover)
     st.plotly_chart(fig_risk_levels_bar_hover(totals_by_level), use_container_width=True)
@@ -1996,8 +2136,8 @@ elif page == "⚠️ Riesgos":
         kpi_lines = [
             f"Rango: {d_from.isoformat()} → {d_to.isoformat()}",
             f"TOTAL EVENTOS EVALUADOS: {fmt_int(int(risks_filtered.get('risk_pool', 0)))}",
-            f"HAY RIESGO: {fmt_int(int(totals_by_level.get('HAY_RIESGO', 0)))}",
-            f"NO HAY RIESGO: {fmt_int(int(totals_by_level.get('NO_RIESGO', 0)))}",
+            f"RIESGO ALTO: {fmt_int(int(totals_by_level.get('ALTO', 0)))}",
+            f"RIESGO BAJO: {fmt_int(int(totals_by_level.get('BAJO', 0)))}",
         ]
         pdf = build_pdf_bytes(
             "Reporte CIMU - Riesgos",
@@ -2079,12 +2219,12 @@ else:
 
     st.dataframe(rows_cmp, use_container_width=True, hide_index=True)
 
-    st.plotly_chart(fig_context_bar_hover(ct), use_container_width=True)
     st.plotly_chart(fig_context_lines_hover(cm), use_container_width=True)
 
     st.subheader("Fuentes y notas")
     st.write("• Policía Nacional – SIEDCO (VIF, delitos sexuales).")
     st.write("• Comité Interinstitucional de Muerte por Causa Externa – CIMCE (homicidios, feminicidios).")
+    st.write("• Comité Interinstitucional de Consolidación de Información para Mujeres (CIMU).")
     st.write("• Este prototipo usa datos mock para demostración; la estructura está lista para conectar CSV/BD/API.")
 
     if st.button("Exportar PDF (Contexto)"):
